@@ -26,6 +26,11 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 
+import wandb
+
+# Add requirement for wandb core
+wandb.require("core")
+
 
 model_names = sorted(
     name
@@ -154,6 +159,10 @@ parser.add_argument(
     "--pretrained", default="", type=str, help="path to moco pretrained checkpoint"
 )
 
+# added
+parser.add_argument("--wandb", action="store_true")
+parser.add_argument('-t', '--tags', action='append')
+
 best_acc1 = 0
 
 
@@ -197,6 +206,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
+    run = setup_run(args)
     global best_acc1
     args.gpu = gpu
 
@@ -388,14 +398,24 @@ def main_worker(gpu, ngpus_per_node, args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
-
+        new_lr = adjust_learning_rate(optimizer, epoch, args)
+        if run:
+            wandb.log({
+                "epoch": epoch,
+                "lr": new_lr,
+            })
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, run)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1, acc5, loss = validate(val_loader, model, criterion, args)
 
+        if run:
+            wandb.log({
+                "valid/loss": loss,
+                "valid/top1": acc1,
+                "valid/top5": acc5
+            })
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -415,9 +435,11 @@ def main_worker(gpu, ngpus_per_node, args):
             )
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
+    if run: 
+        wandb.finish()
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, run=None):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
@@ -456,7 +478,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
-
+        if run:
+            wandb.log({
+                "train/step": i + epoch * len(train_loader),
+                "train/loss": loss.item(),
+                "train/top1": acc1[0],
+                "train/top5": acc5[0]
+            })
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
@@ -498,7 +526,7 @@ def validate(val_loader, model, criterion, args):
             losses.update(loss.item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
-
+              
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -511,7 +539,7 @@ def validate(val_loader, model, criterion, args):
             " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(top1=top1, top5=top5)
         )
 
-    return top1.avg
+    return top1.avg, top5.avg, losses.avg
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -597,7 +625,7 @@ def adjust_learning_rate(optimizer, epoch, args):
         lr *= 0.1 if epoch >= milestone else 1.0
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-
+    return lr
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -611,10 +639,21 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].contiguous().view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def setup_run(args):
+    run = None
+    if args.wandb:
+        run = wandb.init(
+            project = "moco_linear",
+            group = "DDP",
+            config = args, 
+            tags = args.tags
+        )
+        
+    return run 
 
 if __name__ == "__main__":
     main()

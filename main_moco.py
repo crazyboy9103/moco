@@ -30,6 +30,11 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 
+import wandb
+
+# Add requirement for wandb core
+wandb.require("core")
+
 
 model_names = sorted(
     name
@@ -176,6 +181,10 @@ parser.add_argument(
 )
 parser.add_argument("--cos", action="store_true", help="use cosine lr schedule")
 
+# added
+parser.add_argument("--wandb", action="store_true")
+parser.add_argument("--syncbn", action="store_true")
+parser.add_argument('-t', '--tags', action='append')
 
 def main():
     args = parser.parse_args()
@@ -210,13 +219,13 @@ def main():
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args,))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
-
+        main_worker(args.gpu, ngpus_per_node, args,)
 
 def main_worker(gpu, ngpus_per_node, args):
+    run = setup_run(args)
     args.gpu = gpu
 
     # suppress printing if not master
@@ -252,10 +261,12 @@ def main_worker(gpu, ngpus_per_node, args):
         args.moco_m,
         args.moco_t,
         args.mlp,
+        args.syncbn
     )
-    print(model)
-
     if args.distributed:
+        if args.syncbn:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
@@ -369,10 +380,14 @@ def main_worker(gpu, ngpus_per_node, args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
-
+        new_lr = adjust_learning_rate(optimizer, epoch, args)
+        if run:
+            wandb.log({
+                "epoch": epoch,
+                "lr": new_lr,
+            })
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, run)
 
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
@@ -387,9 +402,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 is_best=False,
                 filename="checkpoint_{:04d}.pth.tar".format(epoch),
             )
+    if run: 
+        wandb.finish()
 
-
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, run=None):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
@@ -424,6 +440,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         top1.update(acc1[0], images[0].size(0))
         top5.update(acc5[0], images[0].size(0))
 
+        if run:
+            wandb.log({
+                "step": i + epoch * len(train_loader),
+                "loss": loss.item(),
+                "top1": acc1[0],
+                "top5": acc5[0]
+            })
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
@@ -495,6 +518,7 @@ def adjust_learning_rate(optimizer, epoch, args):
             lr *= 0.1 if epoch >= milestone else 1.0
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
+    return lr
 
 
 def accuracy(output, target, topk=(1,)):
@@ -509,10 +533,21 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].contiguous().view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-
+def setup_run(args):
+    run = None
+    if args.wandb:
+        run = wandb.init(
+            project = "moco",
+            group = "DDP",
+            config = args, 
+            tags = args.tags
+        )
+        
+    return run 
+    
 if __name__ == "__main__":
     main()

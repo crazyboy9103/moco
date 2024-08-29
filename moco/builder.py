@@ -13,7 +13,7 @@ class MoCo(nn.Module):
     https://arxiv.org/abs/1911.05722
     """
 
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, syncbn=False):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -51,6 +51,7 @@ class MoCo(nn.Module):
         self.queue = nn.functional.normalize(self.queue, dim=0)
 
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        self.syncbn = syncbn
 
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
@@ -71,6 +72,7 @@ class MoCo(nn.Module):
 
         ptr = int(self.queue_ptr)
         assert self.K % batch_size == 0  # for simplicity
+
 
         # replace the keys at ptr (dequeue and enqueue)
         self.queue[:, ptr : ptr + batch_size] = keys.T
@@ -142,14 +144,16 @@ class MoCo(nn.Module):
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
 
-            # shuffle for making use of BN
-            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+            if not self.syncbn:
+                # shuffle for making use of BN
+                im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
             k = self.encoder_k(im_k)  # keys: NxC
             k = nn.functional.normalize(k, dim=1)
 
-            # undo shuffle
-            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+            if not self.syncbn:
+                # undo shuffle
+                k = self._batch_unshuffle_ddp(k, idx_unshuffle)
 
         # compute logits
         # Einstein sum is more intuitive
